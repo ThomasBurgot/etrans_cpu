@@ -1,0 +1,226 @@
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:46      page 1
+
+Switches: -noasm -nodclchk -debug -nodlines -line -list
+          -idir .D[1]
+          -idir .D[2]
+          -idir .D[3]
+          -idir .D[4]
+          -idir .D[5]
+          -idir .D[6]
+          -idir .D[7]
+          -idir .D[8]
+          -idir .D[9]
+          -idir .D[10]
+          -idir .D[11]
+          -idir .D[12]
+          -idir .D[13]
+          -idir .D[14]
+          -idir /gpfs7kro/gpfslocalsys/nvhpc/20.11/Linux_x86_64/20.11/comm_libs/openmpi/openmpi-3.1.5/include
+          -idir /gpfs7kro/gpfslocalsys/nvhpc/20.11/Linux_x86_64/20.11/comm_libs/openmpi/openmpi-3.1.5/lib
+          -inform severe -opt 2 -nosave -object -noonetrip
+          -depchk on -nostandard     
+          -symbol -noupcase    
+
+Filename: nvtx.F90
+
+(    1) module nvtx
+(    2) 
+(    3)     use iso_c_binding
+(    4)     implicit none
+(    5) 
+(    6)     integer,private :: col(7) = [ Z'0000ff00', Z'000000ff', Z'00ffff00', Z'00ff00ff', Z'0000ffff', Z'00ff0000', Z'00ffffff']
+(    7)     character,private,target :: tempName(256)
+(    8) 
+(    9)     type, bind(C):: nvtxEventAttributes
+(   10)       integer(C_INT16_T):: version=1
+(   11)       integer(C_INT16_T):: size=48 !
+(   12)       integer(C_INT):: category=0
+(   13)       integer(C_INT):: colorType=1 ! NVTX_COLOR_ARGB = 1
+(   14)       integer(C_INT):: color
+(   15)       integer(C_INT):: payloadType=0 ! NVTX_PAYLOAD_UNKNOWN = 0
+(   16)       integer(C_INT):: reserved0
+(   17)       integer(C_INT64_T):: payload   ! union uint,int,double
+(   18)       integer(C_INT):: messageType=1  ! NVTX_MESSAGE_TYPE_ASCII     = 1
+(   19)       type(C_PTR):: message  ! ascii char
+(   20)     end type
+(   21) 
+(   22)     interface nvtxRangePush
+(   23)       ! push range with custom label and standard color
+(   24)       subroutine nvtxRangePushA(name) bind(C, name='nvtxRangePushA')
+(   25)       use iso_c_binding
+(   26)       character(kind=C_CHAR) :: name(256)
+(   27)       end subroutine
+(   28) 
+(   29)       ! push range with custom label and custom color
+(   30)       subroutine nvtxRangePushEx(event) bind(C, name='nvtxRangePushEx')
+(   31)       use iso_c_binding
+(   32)       import:: nvtxEventAttributes
+(   33)       type(nvtxEventAttributes):: event
+(   34)       end subroutine
+(   35)     end interface
+(   36) 
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:46      page 2
+
+(   37)     interface nvtxRangePop
+(   38)       subroutine nvtxRangePop() bind(C, name='nvtxRangePop')
+(   39)       end subroutine
+(   40)     end interface
+(   41) 
+(   42)     contains
+(   43) 
+(   44)     subroutine nvtxStartRange(name,id)
+(   45)       character(kind=c_char,len=*) :: name
+(   46)       integer, optional:: id
+(   47)       type(nvtxEventAttributes):: event
+(   48)       character(kind=c_char,len=256) :: trimmed_name
+(   49)       integer:: i
+(   50) 
+(   51)       trimmed_name=trim(name)//c_null_char
+(   52) 
+(   53)       ! move scalar trimmed_name into character array tempName
+(   54)       do i=1,LEN(trim(name)) + 1
+(   55)          tempName(i) = trimmed_name(i:i)
+(   56)       enddo
+(   57) 
+(   58) 
+(   59)       if ( .not. present(id)) then
+(   60)         call nvtxRangePush(tempName)
+(   61)       else
+(   62)         event%color=col(mod(id,7)+1)
+(   63)         event%message=c_loc(tempName)
+(   64)         call nvtxRangePushEx(event)
+(   65)       end if
+(   66)     end subroutine
+(   67) 
+(   68)     subroutine nvtxEndRange
+(   69)       call nvtxRangePop
+(   70)     end subroutine
+(   71) 
+(   72)     subroutine nvtxStartRange_nop(name,id)
+(   73)       character(kind=c_char,len=*) :: name
+(   74)       integer, optional:: id
+(   75)     end subroutine
+(   76) 
+(   77)     subroutine nvtxEndRange_nop
+(   78)     end subroutine
+(   79) 
+(   80) end module
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:46      page 3
+
+(    1) # 1 "nvtx.F90"
+(    1) module nvtx
+(    2) # 3 "nvtx.F90"
+(    3)     use iso_c_binding
+(    4)     implicit none
+(    5) # 6 "nvtx.F90"
+(    6)     integer,private :: col(7) = [ Z'0000ff00', Z'000000ff', Z'00ffff00', Z'00ff00ff', Z'0000ffff', Z'00ff0000', Z'00ffffff']
+(    7)     character,private,target :: tempName(256)
+(    8) # 9 "nvtx.F90"
+(    9)     type, bind(C):: nvtxEventAttributes
+(   10)       integer(C_INT16_T):: version=1
+(   11)       integer(C_INT16_T):: size=48 !
+(   12)       integer(C_INT):: category=0
+(   13)       integer(C_INT):: colorType=1 ! NVTX_COLOR_ARGB = 1
+(   14)       integer(C_INT):: color
+(   15)       integer(C_INT):: payloadType=0 ! NVTX_PAYLOAD_UNKNOWN = 0
+(   16)       integer(C_INT):: reserved0
+(   17)       integer(C_INT64_T):: payload   ! union uint,int,double
+(   18)       integer(C_INT):: messageType=1  ! NVTX_MESSAGE_TYPE_ASCII     = 1
+(   19)       type(C_PTR):: message  ! ascii char
+(   20)     end type
+(   21) # 22 "nvtx.F90"
+(   22)     interface nvtxRangePush
+(   23)       ! push range with custom label and standard color
+(   24)       subroutine nvtxRangePushA(name) bind(C, name='nvtxRangePushA')
+(   25)       use iso_c_binding
+(   26)       character(kind=C_CHAR) :: name(256)
+(   27)       end subroutine
+(   28) # 29 "nvtx.F90"
+(   29)       ! push range with custom label and custom color
+(   30)       subroutine nvtxRangePushEx(event) bind(C, name='nvtxRangePushEx')
+(   31)       use iso_c_binding
+(   32)       import:: nvtxEventAttributes
+(   33)       type(nvtxEventAttributes):: event
+(   34)       end subroutine
+(   35)     end interface
+(   36) # 37 "nvtx.F90"
+(   37)     interface nvtxRangePop
+(   38)       subroutine nvtxRangePop() bind(C, name='nvtxRangePop')
+(   39)       end subroutine
+(   40)     end interface
+(   41) # 42 "nvtx.F90"
+(   42)     contains
+(   43) # 44 "nvtx.F90"
+(   44)     subroutine nvtxStartRange(name,id)
+(   45)       character(kind=c_char,len=*) :: name
+(   46)       integer, optional:: id
+(   47)       type(nvtxEventAttributes):: event
+(   48)       character(kind=c_char,len=256) :: trimmed_name
+(   49)       integer:: i
+(   50) # 51 "nvtx.F90"
+(   51)       trimmed_name=trim(name)//c_null_char
+(   52) # 53 "nvtx.F90"
+(   53)       ! move scalar trimmed_name into character array tempName
+(   54)       do i=1,LEN(trim(name)) + 1
+(   55)          tempName(i) = trimmed_name(i:i)
+(   56)       enddo
+(   57) # 59 "nvtx.F90"
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:46      page 4
+
+(   59)       if ( .not. present(id)) then
+(   60)         call nvtxRangePush(tempName)
+(   61)       else
+(   62)         event%color=col(mod(id,7)+1)
+(   63)         event%message=c_loc(tempName)
+(   64)         call nvtxRangePushEx(event)
+(   65)       end if
+(   66)     end subroutine
+(   67) # 68 "nvtx.F90"
+(   68)     subroutine nvtxEndRange
+(   69)       call nvtxRangePop
+(   70)     end subroutine
+(   71) # 72 "nvtx.F90"
+(   72)     subroutine nvtxStartRange_nop(name,id)
+(   73)       character(kind=c_char,len=*) :: name
+(   74)       integer, optional:: id
+(   75)     end subroutine
+(   76) # 77 "nvtx.F90"
+(   77)     subroutine nvtxEndRange_nop
+(   78)     end subroutine
+(   79) # 80 "nvtx.F90"
+(   80) end module

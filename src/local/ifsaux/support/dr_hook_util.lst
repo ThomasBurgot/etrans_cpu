@@ -1,0 +1,786 @@
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 1
+
+Switches: -noasm -nodclchk -debug -nodlines -line -list
+          -idir .D[1]
+          -idir .D[2]
+          -idir .D[3]
+          -idir .D[4]
+          -idir .D[5]
+          -idir .D[6]
+          -idir .D[7]
+          -idir .D[8]
+          -idir .D[9]
+          -idir .D[10]
+          -idir .D[11]
+          -idir .D[12]
+          -idir .D[13]
+          -idir .D[14]
+          -idir /gpfs7kro/gpfslocalsys/nvhpc/20.11/Linux_x86_64/20.11/comm_libs/openmpi/openmpi-3.1.5/include
+          -idir /gpfs7kro/gpfslocalsys/nvhpc/20.11/Linux_x86_64/20.11/comm_libs/openmpi/openmpi-3.1.5/lib
+          -inform severe -opt 2 -nosave -object -noonetrip
+          -depchk on -nostandard     
+          -symbol -noupcase    
+
+Filename: dr_hook_util.F90
+
+(    1) SUBROUTINE DR_HOOK_UTIL(LDHOOK,CDNAME,KCASE,PKEY,CDFILENAME,KSIZEINFO)
+(    2) USE PARKIND1  ,ONLY : JPIM     ,JPRB    ,JPRD
+(    3) USE OML_MOD,ONLY : OML_MAX_THREADS,OML_MY_THREAD,OML_INIT
+(    4) USE MPL_INIT_MOD, ONLY : MPL_INIT
+(    5) USE MPL_ARG_MOD, ONLY : MPL_GETARG
+(    6) USE YOMGSTATS, ONLY : LAST_KNUM,LAST_KSWITCH,LDETAILED_STATS,MYPROC_STATS, &
+(    7)                       NHOOK_MESSAGES,TIME_LAST_CALL
+(    8) USE YOMHOOKSTACK, ONLY : LL_THREAD_FIRST,ISAVE,IMAXSTACK,CSTACK   ! For monitoring thread stack usage
+(    9) !<DrHack> 
+(   10) USE MPL_MYRANK_MOD,ONLY : MPL_MYRANK ! useful for DrHack
+(   11) USE YOMLUN_IFSAUX, ONLY : NULDRHACK
+(   12) USE NVTX
+(   13) !</DrHack>
+(   14) 
+(   15) IMPLICIT NONE
+(   16) LOGICAL,INTENT(INOUT)       :: LDHOOK
+(   17) CHARACTER(LEN=*),INTENT(IN) :: CDNAME,CDFILENAME
+(   18) INTEGER(KIND=JPIM),INTENT(IN) :: KCASE,KSIZEINFO
+(   19) REAL(KIND=JPRB),INTENT(INOUT) :: PKEY
+(   20) #ifdef RS6K
+(   21) INTEGER(KIND=JPIM) :: INEWMASK, IOLDMASK, UMASK
+(   22) #endif
+(   23) #ifdef CRAYXT
+(   24) INTEGER(KIND=JPIM) :: IRET, SETVBUF3F
+(   25) #endif
+(   26) LOGICAL,SAVE :: LL_FIRST_TIME = .TRUE.
+(   27) CHARACTER(LEN=512) :: CLENV
+(   28) INTEGER(KIND=JPIM) INUMTIDS, IMYTID
+(   29) LOGICAL :: LLMPI
+(   30) INTEGER*8 :: MAXMEM=0
+(   31) INTEGER*8 :: GETMAXMEM
+(   32) INTEGER*8 GETMAXLOC
+(   33) LOGICAL :: LLFINDSUMB=.FALSE.
+(   34) REAL(KIND=JPRD) :: ZCLOCK
+(   35) REAL(KIND=JPRB) :: ZDIFF
+(   36) CHARACTER(LEN=7) CLSTR
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 2
+
+(   37) 
+(   38) INTEGER*8 ILOC         ! For monitoring thread stack usage
+(   39) CHARACTER(LEN=3) CHEAP ! For monitoring heap usage
+(   40) INTEGER          JHEAP ! For monitoring heap usage
+(   41) DATA JHEAP/0/
+(   42) 
+(   43) !useful variable for DrHack
+(   44) LOGICAL,SAVE :: LL_DRHACK=.FALSE. !set to .TRUE. if MPIRANK=0 and Env variable DR_HACK=1
+(   45) INTEGER,SAVE :: II_DRNVTX = 0     ! 0=no initialized, -1=nvtx off, +1=nvtx on
+(   46) 
+(   47) #include "user_clock.h"
+(   48) 
+(   49) !
+(   50) ! Florian Suzat (METEO-FRANCE) Sept 2017 : add drHack functionality
+(   51) !
+(   52) ! drHack documentation:
+(   53) ! ----------------------------------
+(   54) ! ARPIFS has become a huge and complicated program. Debugging it can be very
+(   55) ! painful especially for newbies. Documenting it is also is a huge and tedious
+(   56) ! job.
+(   57) ! The idea behind “drHack” is basically to hack drHook: using the calls 
+(   58) ! "IF (LHOOK) CALL DR_HOOK('XXX',I,ZHOOK_HANDLE)" 
+(   59) ! (where XXX is the name of a routine, and I is 0 at the beginning of the
+(   60) ! routine and 1 at
+(   61) ! the end) in order to build a big XML file describing the ARPIFS calling tree.
+(   62) ! At initialization, if both environmental variables DR_HOOK and DR_HACK are set
+(   63) ! equal to 1, 
+(   64) ! then the hack is activated, otherwise everything works as usual.
+(   65) 
+(   66) ! IMPORTANT: for the moment, it does not work with openmp
+(   67) ! (need to run with openmp=1) 
+(   68) 
+(   69) ! When active, we first open a file drhack.txt.
+(   70) ! Every time the program enters a routine, we append <ROUTINE_NAME> to the
+(   71) ! file, and every time the routine is left, we append </ROUTINE_NAME> (mind the
+(   72) ! “/” extra character).
+(   73) ! Then, at the end of the run, the (big!) file drhack.txt contains the calling
+(   74) ! tree of the MPI processor number 0 as an XML file:
+(   75) ! <MASTER>
+(   76) ! <STACK_MIX_INIT_STACK>
+(   77) ! <STACK_MIX_GETSTACKUSAGEX>
+(   78) ! </STACK_MIX_GETSTACKUSAGEX>
+(   79) ! </STACK_MIX_INIT_STACK>
+(   80) ! <CNT0>
+(   81) ! <GEOMETRY_MOD_GEOMETRY_SET>
+(   82) ! </GEOMETRY_MOD_GEOMETRY_SET>
+(   83) ! ....
+(   84) ! 
+(   85) ! The resulting files are not usable as is (because they are too big). But with
+(   86) ! a few
+(   87) ! lines of python, it is easy to produce a condensed version of the drhack.txt
+(   88) ! file
+(   89) ! (if you want an example script, you may ask florian.suzat@meteo.fr).
+(   90) ! Then, with html and javascript, these condensed files are read and a
+(   91) ! dynamic collapsible search tree is built.
+(   92) ! Illustrations of such pages can be seen at http://intra.cnrm.meteo.fr/drhack/ 
+(   93) ! (only from the MeteoFrance network... If you want an export, mail
+(   94) ! florian.suzat@meteo.fr)
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 3
+
+(   95) 
+(   96) ! Hope this help...
+(   97) 
+(   98) IF (II_DRNVTX == 0) THEN
+(   99) BLOCK
+(  100)   CHARACTER*32 :: CL_NVTX
+(  101)   CALL GETENV ('DR_NVTX', CL_NVTX)
+(  102)   IF (CL_NVTX == '1') THEN
+(  103)     II_DRNVTX = +1
+(  104)   ELSE
+(  105)     II_DRNVTX = -1
+(  106)   ENDIF
+(  107) ENDBLOCK
+(  108) ENDIF
+(  109) 
+(  110) IF (II_DRNVTX == 1) THEN
+(  111)   IF (KCASE == 0) THEN
+(  112)     CALL NVTXSTARTRANGE(CDNAME)
+(  113)   ELSEIF (KCASE==1) THEN
+(  114)     CALL NVTXENDRANGE
+(  115)   ENDIF
+(  116)   RETURN
+(  117) ENDIF
+(  118) 
+(  119) 
+(  120) ! -----------------------------------------------------------------
+(  121) 
+(  122) IF (.NOT.LDHOOK) RETURN
+(  123) 
+(  124) IMYTID = OML_MY_THREAD()
+(  125) INUMTIDS = OML_MAX_THREADS()
+(  126) IF (LL_FIRST_TIME) THEN
+(  127)   LL_FIRST_TIME = .FALSE.
+(  128) #ifdef CRAYXT
+(  129)   IRET = SETVBUF3F(0, 1, 0) ! Set unit#0 into line-buffering mode to avoid messy output
+(  130) #endif
+(  131)   CALL OML_INIT()
+(  132)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_NOT_MPI',CLENV)
+(  133)   IF (CLENV == ' ' .OR. CLENV == '0' .OR. &
+(  134)     & CLENV == 'false' .OR. CLENV == 'FALSE') THEN
+(  135)     LLMPI=.TRUE.
+(  136)     CALL MPL_INIT(LDINFO=.FALSE.) ! Do not produce any output
+(  137)   ELSE
+(  138)     LLMPI=.FALSE.
+(  139)   ENDIF
+(  140)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK',CLENV)
+(  141)   IF (CLENV == ' ' .OR. CLENV == '0' .OR. &
+(  142)     & CLENV == 'false' .OR. CLENV == 'FALSE') THEN
+(  143)     LDHOOK = .FALSE.
+(  144)     CALL C_DRHOOK_SET_LHOOK(0)
+(  145)   ENDIF
+(  146)   IF (LLMPI) THEN
+(  147)     CALL MPL_GETARG(0, CLENV)  ! Get executable name & also propagate args
+(  148)   ELSE
+(  149)     CALL GET_COMMAND_ARGUMENT(0, CLENV)
+(  150)   ENDIF
+(  151)   IF (.NOT.LDHOOK) RETURN
+(  152)   
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 4
+
+(  153)   CALL C_DRHOOK_INIT(CLENV, INUMTIDS)
+(  154) 
+(  155) !JFH---Initialisation to monitor stack usage by threads-------------
+(  156)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_STACKCHECK',CSTACK)
+(  157)   IF (CSTACK == 'yes' .OR. CSTACK == 'YES' ) THEN
+(  158)     IF(IMYTID == 1 ) THEN
+(  159)       ALLOCATE(LL_THREAD_FIRST(INUMTIDS))
+(  160)       ALLOCATE(ISAVE(INUMTIDS))
+(  161)       ALLOCATE(IMAXSTACK(INUMTIDS))
+(  162)       LL_THREAD_FIRST=.TRUE.
+(  163)       ISAVE=0
+(  164)       IMAXSTACK=0
+(  165)     ENDIF
+(  166)   ENDIF
+(  167) !JFH------------ End ---------------------------------------------
+(  168) !JFH---Initialisation to monitor heap usage-----------------------
+(  169)   JHEAP=0
+(  170)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_HEAPCHECK',CHEAP)
+(  171)   IF (CHEAP == 'yes' .OR. CHEAP == 'YES' ) JHEAP=1
+(  172)   IF (CHEAP == 'trb' .OR. CHEAP == 'TRB' ) JHEAP=2
+(  173)   IF(IMYTID == 1) THEN
+(  174)     IF(JHEAP>0) THEN
+(  175) !     write(0,*) "HEAPCHECK=",CHEAP,JHEAP
+(  176)       CALL SETHEAPCHECK()
+(  177)     ENDIF
+(  178)   ENDIF
+(  179) !JFH------------ End ---------------------------------------------
+(  180) 
+(  181)  !DrHack initialisation
+(  182)  CALL GET_ENVIRONMENT_VARIABLE('DR_HACK',CLENV)
+(  183)  IF ((CLENV == '1') .and. ( MPL_MYRANK() ==1 )) THEN
+(  184)    LL_DRHACK=.TRUE.  
+(  185)    OPEN (UNIT = NULDRHACK, file = "drhack.txt",position="append",action="write")
+(  186)  ENDIF
+(  187) 
+(  188) ENDIF
+(  189) 
+(  190) !JFH---Code to monitor stack usage by threads---------------------
+(  191) #ifndef NAG
+(  192) IF (CSTACK == 'yes' .or. CSTACK == 'YES' ) THEN
+(  193)   IF(IMYTID > 1) THEN
+(  194)     IF(LL_THREAD_FIRST(IMYTID))THEN 
+(  195)       LL_THREAD_FIRST(IMYTID)=.FALSE.
+(  196)       ISAVE(IMYTID)=LOC(LLMPI)
+(  197)     ENDIF
+(  198)     ILOC=LOC(LLMPI)
+(  199)     IF(ISAVE(IMYTID)-ILOC > IMAXSTACK(IMYTID)) THEN
+(  200)       IMAXSTACK(IMYTID)=ISAVE(IMYTID)-ILOC
+(  201)       WRITE(0,'(A,I3,A,I12,2X,A)')"STACKCHECK Max stack usage by thread",imytid," =",IMAXSTACK(IMYTID),CDNAME
+(  202)     ENDIF
+(  203)   ENDIF
+(  204) ENDIF
+(  205) #endif
+(  206) !JFH------------ End ---------------------------------------------
+(  207) 
+(  208) IF (KCASE == 0) THEN
+(  209)   CALL C_DRHOOK_START(CDNAME, IMYTID, PKEY, CDFILENAME, KSIZEINFO)
+(  210) !JFH---Code to monitor heap usage -------------------------
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 5
+
+(  211)   IF(IMYTID == 1 .AND. MYPROC_STATS == 1 .AND. JHEAP>0) THEN
+(  212)     GETMAXMEM=GETMAXLOC()
+(  213)     IF(GETMAXMEM .GT. MAXMEM) THEN
+(  214)       MAXMEM = GETMAXMEM
+(  215)       WRITE(0,*) "HEAPCHECK Max heap at beg of routine =",MAXMEM," ",CDNAME
+(  216) #ifdef RS6K
+(  217)       IF(JHEAP == 2) CALL XL__TRBK()
+(  218) #endif
+(  219)     ENDIF
+(  220)   ENDIF
+(  221) !JFH------------ End ---------------------------------------------
+(  222) ELSE IF (KCASE == 1) THEN
+(  223) !JFH---Code to monitor heap usage -------------------------
+(  224)   IF(IMYTID == 1 .AND. MYPROC_STATS == 1 .AND. JHEAP>0) THEN
+(  225)     GETMAXMEM=GETMAXLOC()
+(  226)     IF(GETMAXMEM .GT. MAXMEM) THEN
+(  227)       MAXMEM = GETMAXMEM
+(  228)       WRITE(0,*) "HEAPCHECK Max heap at end of routine =",MAXMEM," ",CDNAME
+(  229) #ifdef RS6K
+(  230)       IF(JHEAP == 2) CALL XL__TRBK()
+(  231) #endif
+(  232)     ENDIF
+(  233)   ENDIF
+(  234) !JFH------------ End ---------------------------------------------
+(  235)   CALL C_DRHOOK_END  (CDNAME, IMYTID, PKEY, CDFILENAME, KSIZEINFO)
+(  236) ENDIF
+(  237) ! calling the drHackFunction
+(  238) IF (LL_DRHACK) THEN 
+(  239)   CALL DR_HACK(CDNAME,KCASE,NULDRHACK)
+(  240) ENDIF
+(  241) 
+(  242) 
+(  243) 
+(  244) !GM---Code to find gstats SUMB time-------------------------------
+(  245) IF( LDETAILED_STATS .AND. LLFINDSUMB )THEN
+(  246)   IF( IMYTID==1 .AND. LAST_KNUM>=500 .AND. MYPROC_STATS <= 2 )THEN
+(  247)     IF( LAST_KSWITCH==1 .OR. LAST_KSWITCH==2 )THEN
+(  248)       CALL USER_CLOCK(PELAPSED_TIME=ZCLOCK)
+(  249)       ZDIFF=ZCLOCK-TIME_LAST_CALL
+(  250)       IF( ZDIFF > 0.1_JPRB )THEN
+(  251)         IF( KCASE == 0 )THEN
+(  252)           CLSTR='ENTERED'
+(  253)         ELSE
+(  254)           CLSTR='EXITED'
+(  255)         ENDIF
+(  256)         IF( NHOOK_MESSAGES < 100000 )THEN
+(  257)           WRITE(0,'("DR_HOOK_UTIL: ",A,2X,A," TIMESUMB=",F10.6)')CDNAME,CLSTR,ZDIFF
+(  258)           NHOOK_MESSAGES=NHOOK_MESSAGES+1
+(  259)         ENDIF
+(  260)       ENDIF
+(  261)     ENDIF
+(  262)   ENDIF
+(  263) ENDIF
+(  264) !GM------------ End ---------------------------------------------
+(  265) 
+(  266) END SUBROUTINE DR_HOOK_UTIL
+(  267) 
+(  268) SUBROUTINE DR_HACK(ROUTINE,START,DRHACKUNIT)
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 6
+
+(  269) ! Different implementation of this have been tested, but this one, even if it is
+(  270) ! not elegant at all, is almost fast.... 
+(  271) 
+(  272) USE PARKIND1  ,ONLY : JPIM
+(  273) IMPLICIT NONE
+(  274) CHARACTER(LEN=*),INTENT(IN) :: ROUTINE
+(  275) INTEGER(KIND=JPIM),INTENT(IN) :: START
+(  276) INTEGER(KIND=JPIM),INTENT(IN) :: DRHACKUNIT
+(  277) INTEGER(KIND=JPIM) :: i
+(  278) CHARACTER(LEN(ROUTINE)) :: ROUTINE_CLEAN
+(  279) 
+(  280) ! replace some special character
+(  281) DO i = 1,LEN(ROUTINE)
+(  282)  SELECT CASE (ROUTINE(i:i))
+(  283)   CASE ("<")
+(  284)    ROUTINE_CLEAN (i:i)="_"
+(  285)   CASE (">")
+(  286)    ROUTINE_CLEAN (i:i)="_"
+(  287)   CASE (":")
+(  288)    ROUTINE_CLEAN (i:i)="_"
+(  289)   CASE (" ")
+(  290)    ROUTINE_CLEAN (i:i)="_"
+(  291)   CASE DEFAULT
+(  292)    ROUTINE_CLEAN (i:i)=ROUTINE(i:i)
+(  293)  END SELECT
+(  294) END DO
+(  295) 
+(  296) 
+(  297) IF (START==0) THEN
+(  298)  WRITE(DRHACKUNIT,*) '<',ROUTINE_CLEAN,'>'
+(  299) ELSE
+(  300)  WRITE(DRHACKUNIT,*) '</',ROUTINE_CLEAN,'>'
+(  301)  !CLOSE FILE IF LAST ROUTINE
+(  302)  IF (ROUTINE_CLEAN .eq. 'MODEL_MOD_MODEL_DELETE') THEN
+(  303)    CLOSE (DRHACKUNIT)
+(  304)  ENDIF
+(  305) ENDIF
+(  306) 
+(  307) END SUBROUTINE DR_HACK
+(  308) 
+(  309) 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 7
+
+(    1) # 1 "dr_hook_util.F90"
+(    1) SUBROUTINE DR_HOOK_UTIL(LDHOOK,CDNAME,KCASE,PKEY,CDFILENAME,KSIZEINFO)
+(    2) USE PARKIND1  ,ONLY : JPIM     ,JPRB    ,JPRD
+(    3) USE OML_MOD,ONLY : OML_MAX_THREADS,OML_MY_THREAD,OML_INIT
+(    4) USE MPL_INIT_MOD, ONLY : MPL_INIT
+(    5) USE MPL_ARG_MOD, ONLY : MPL_GETARG
+(    6) USE YOMGSTATS, ONLY : LAST_KNUM,LAST_KSWITCH,LDETAILED_STATS,MYPROC_STATS, &
+(    7)                       NHOOK_MESSAGES,TIME_LAST_CALL
+(    8) USE YOMHOOKSTACK, ONLY : LL_THREAD_FIRST,ISAVE,IMAXSTACK,CSTACK   ! For monitoring thread stack usage
+(    9) !<DrHack> 
+(   10) USE MPL_MYRANK_MOD,ONLY : MPL_MYRANK ! useful for DrHack
+(   11) USE YOMLUN_IFSAUX, ONLY : NULDRHACK
+(   12) USE NVTX
+(   13) !</DrHack>
+(   14) # 15 "dr_hook_util.F90"
+(   15) IMPLICIT NONE
+(   16) LOGICAL,INTENT(INOUT)       :: LDHOOK
+(   17) CHARACTER(LEN=*),INTENT(IN) :: CDNAME,CDFILENAME
+(   18) INTEGER(KIND=JPIM),INTENT(IN) :: KCASE,KSIZEINFO
+(   19) REAL(KIND=JPRB),INTENT(INOUT) :: PKEY
+(   20) # 26 "dr_hook_util.F90"
+(   26) LOGICAL,SAVE :: LL_FIRST_TIME = .TRUE.
+(   27) CHARACTER(LEN=512) :: CLENV
+(   28) INTEGER(KIND=JPIM) INUMTIDS, IMYTID
+(   29) LOGICAL :: LLMPI
+(   30) INTEGER*8 :: MAXMEM=0
+(   31) INTEGER*8 :: GETMAXMEM
+(   32) INTEGER*8 GETMAXLOC
+(   33) LOGICAL :: LLFINDSUMB=.FALSE.
+(   34) REAL(KIND=JPRD) :: ZCLOCK
+(   35) REAL(KIND=JPRB) :: ZDIFF
+(   36) CHARACTER(LEN=7) CLSTR
+(   37) # 38 "dr_hook_util.F90"
+(   38) INTEGER*8 ILOC         ! For monitoring thread stack usage
+(   39) CHARACTER(LEN=3) CHEAP ! For monitoring heap usage
+(   40) INTEGER          JHEAP ! For monitoring heap usage
+(   41) DATA JHEAP/0/
+(   42) # 43 "dr_hook_util.F90"
+(   43) !useful variable for DrHack
+(   44) LOGICAL,SAVE :: LL_DRHACK=.FALSE. !set to .TRUE. if MPIRANK=0 and Env variable DR_HACK=1
+(   45) INTEGER,SAVE :: II_DRNVTX = 0     ! 0=no initialized, -1=nvtx off, +1=nvtx on
+(   46) # 47 "dr_hook_util.F90"
+(   47) # 1 ".D[12]/user_clock.h"
+(    1) INTERFACE
+(    2) SUBROUTINE USER_CLOCK(PELAPSED_TIME,PELAPSED_TIME_SINCE,PVECTOR_CP,PTOTAL_CP)
+(    3) # 4 ".D[12]/user_clock.h"
+(    4) !**** *USER_CLOCK* - interface to system dependent timer routines
+(    5) # 6 ".D[12]/user_clock.h"
+(    6) !     Purpose.
+(    7) !     --------
+(    8) !        Returns elapsed and CP from the start of execution.
+(    9) !        Elapsed time is made relative to the first call to USER_CLOCK.
+(   10) # 11 ".D[12]/user_clock.h"
+(   11) !**   Interface.
+(   12) !     ----------
+(   13) !        ZTIME=USER_CLOCK(PELAPSED_TIME,PELAPSED_TIME_SINCE,
+(   14) !                         PVECTOR_CP,PTOTAL_CP)
+(   15) # 16 ".D[12]/user_clock.h"
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 8
+
+(   16) !        Explicit arguments: (All are optional arguments)
+(   17) !                           PELAPSED_TIME=wall clock time (seconds)
+(   18) !                           PELAPSED_TIME_SINCE=wall clock time (seconds)
+(   19) !                             change from input value of this parameter
+(   20) !                           PVECTOR_CP=CP vector time  (seconds)
+(   21) !                           PTOTAL_CP=total CP time   (seconds)
+(   22) # 23 ".D[12]/user_clock.h"
+(   23) !     Author.
+(   24) !     -------
+(   25) !        D.Dent      *ECMWF*
+(   26) # 27 ".D[12]/user_clock.h"
+(   27) !     External References:
+(   28) !     -------------------
+(   29) # 30 ".D[12]/user_clock.h"
+(   30) !        TIMEF,CPTIME
+(   31) # 32 ".D[12]/user_clock.h"
+(   32) !     Modifications.
+(   33) !     --------------
+(   34) !        Original  : 97-09-25
+(   35) !      F. Vana  05-Mar-2015  Support for single precision
+(   36) !     ----------------------------------------------------------
+(   37) # 39 ".D[12]/user_clock.h"
+(   39) USE PARKIND1  ,ONLY : JPRD, JPIM
+(   40) # 41 ".D[12]/user_clock.h"
+(   41) IMPLICIT NONE
+(   42) # 43 ".D[12]/user_clock.h"
+(   43) REAL(KIND=JPRD),INTENT(OUT) :: PELAPSED_TIME,PVECTOR_CP,PTOTAL_CP
+(   44) REAL(KIND=JPRD),INTENT(INOUT) :: PELAPSED_TIME_SINCE
+(   45) OPTIONAL            PELAPSED_TIME,PELAPSED_TIME_SINCE
+(   46) OPTIONAL            PVECTOR_CP,PTOTAL_CP
+(   47) REAL(KIND=JPRD)      :: ZVECTOR_CP,ZTOTAL_CP,ZWALL
+(   48) REAL(KIND=JPRD),EXTERNAL :: TIMEF
+(   49) # 51 ".D[12]/user_clock.h"
+(   51) END SUBROUTINE USER_CLOCK
+(   52) END INTERFACE
+(   53) # 48 "dr_hook_util.F90"
+(   48) # 49 "dr_hook_util.F90"
+(   49) !
+(   50) ! Florian Suzat (METEO-FRANCE) Sept 2017 : add drHack functionality
+(   51) !
+(   52) ! drHack documentation:
+(   53) ! ----------------------------------
+(   54) ! ARPIFS has become a huge and complicated program. Debugging it can be very
+(   55) ! painful especially for newbies. Documenting it is also is a huge and tedious
+(   56) ! job.
+(   57) ! The idea behind “drHack” is basically to hack drHook: using the calls 
+(   58) ! "IF (LHOOK) CALL DR_HOOK('XXX',I,ZHOOK_HANDLE)" 
+(   59) ! (where XXX is the name of a routine, and I is 0 at the beginning of the
+(   60) ! routine and 1 at
+(   61) ! the end) in order to build a big XML file describing the ARPIFS calling tree.
+(   62) ! At initialization, if both environmental variables DR_HOOK and DR_HACK are set
+(   63) ! equal to 1, 
+(   64) ! then the hack is activated, otherwise everything works as usual.
+(   65) # 66 "dr_hook_util.F90"
+(   66) ! IMPORTANT: for the moment, it does not work with openmp
+(   67) ! (need to run with openmp=1) 
+(   68) # 69 "dr_hook_util.F90"
+(   69) ! When active, we first open a file drhack.txt.
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 9
+
+(   70) ! Every time the program enters a routine, we append <ROUTINE_NAME> to the
+(   71) ! file, and every time the routine is left, we append </ROUTINE_NAME> (mind the
+(   72) ! “/” extra character).
+(   73) ! Then, at the end of the run, the (big!) file drhack.txt contains the calling
+(   74) ! tree of the MPI processor number 0 as an XML file:
+(   75) ! <MASTER>
+(   76) ! <STACK_MIX_INIT_STACK>
+(   77) ! <STACK_MIX_GETSTACKUSAGEX>
+(   78) ! </STACK_MIX_GETSTACKUSAGEX>
+(   79) ! </STACK_MIX_INIT_STACK>
+(   80) ! <CNT0>
+(   81) ! <GEOMETRY_MOD_GEOMETRY_SET>
+(   82) ! </GEOMETRY_MOD_GEOMETRY_SET>
+(   83) ! ....
+(   84) ! 
+(   85) ! The resulting files are not usable as is (because they are too big). But with
+(   86) ! a few
+(   87) ! lines of python, it is easy to produce a condensed version of the drhack.txt
+(   88) ! file
+(   89) ! (if you want an example script, you may ask florian.suzat@meteo.fr).
+(   90) ! Then, with html and javascript, these condensed files are read and a
+(   91) ! dynamic collapsible search tree is built.
+(   92) ! Illustrations of such pages can be seen at http://intra.cnrm.meteo.fr/drhack/ 
+(   93) ! (only from the MeteoFrance network... If you want an export, mail
+(   94) ! florian.suzat@meteo.fr)
+(   95) # 96 "dr_hook_util.F90"
+(   96) ! Hope this help...
+(   97) # 98 "dr_hook_util.F90"
+(   98) IF (II_DRNVTX == 0) THEN
+(   99) BLOCK
+(  100)   CHARACTER*32 :: CL_NVTX
+(  101)   CALL GETENV ('DR_NVTX', CL_NVTX)
+(  102)   IF (CL_NVTX == '1') THEN
+(  103)     II_DRNVTX = +1
+(  104)   ELSE
+(  105)     II_DRNVTX = -1
+(  106)   ENDIF
+(  107) ENDBLOCK
+(  108) ENDIF
+(  109) # 110 "dr_hook_util.F90"
+(  110) IF (II_DRNVTX == 1) THEN
+(  111)   IF (KCASE == 0) THEN
+(  112)     CALL NVTXSTARTRANGE(CDNAME)
+(  113)   ELSEIF (KCASE==1) THEN
+(  114)     CALL NVTXENDRANGE
+(  115)   ENDIF
+(  116)   RETURN
+(  117) ENDIF
+(  118) # 120 "dr_hook_util.F90"
+(  120) ! -----------------------------------------------------------------
+(  121) # 122 "dr_hook_util.F90"
+(  122) IF (.NOT.LDHOOK) RETURN
+(  123) # 124 "dr_hook_util.F90"
+(  124) IMYTID = OML_MY_THREAD()
+(  125) INUMTIDS = OML_MAX_THREADS()
+(  126) IF (LL_FIRST_TIME) THEN
+(  127)   LL_FIRST_TIME = .FALSE.
+(  128) # 131 "dr_hook_util.F90"
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 10
+
+(  131)   CALL OML_INIT()
+(  132)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_NOT_MPI',CLENV)
+(  133)   IF (CLENV == ' ' .OR. CLENV == '0' .OR. &
+(  134)     & CLENV == 'false' .OR. CLENV == 'FALSE') THEN
+(  135)     LLMPI=.TRUE.
+(  136)     CALL MPL_INIT(LDINFO=.FALSE.) ! Do not produce any output
+(  137)   ELSE
+(  138)     LLMPI=.FALSE.
+(  139)   ENDIF
+(  140)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK',CLENV)
+(  141)   IF (CLENV == ' ' .OR. CLENV == '0' .OR. &
+(  142)     & CLENV == 'false' .OR. CLENV == 'FALSE') THEN
+(  143)     LDHOOK = .FALSE.
+(  144)     CALL C_DRHOOK_SET_LHOOK(0)
+(  145)   ENDIF
+(  146)   IF (LLMPI) THEN
+(  147)     CALL MPL_GETARG(0, CLENV)  ! Get executable name & also propagate args
+(  148)   ELSE
+(  149)     CALL GET_COMMAND_ARGUMENT(0, CLENV)
+(  150)   ENDIF
+(  151)   IF (.NOT.LDHOOK) RETURN
+(  152)   
+(  153)   CALL C_DRHOOK_INIT(CLENV, INUMTIDS)
+(  154) # 155 "dr_hook_util.F90"
+(  155) !JFH---Initialisation to monitor stack usage by threads-------------
+(  156)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_STACKCHECK',CSTACK)
+(  157)   IF (CSTACK == 'yes' .OR. CSTACK == 'YES' ) THEN
+(  158)     IF(IMYTID == 1 ) THEN
+(  159)       ALLOCATE(LL_THREAD_FIRST(INUMTIDS))
+(  160)       ALLOCATE(ISAVE(INUMTIDS))
+(  161)       ALLOCATE(IMAXSTACK(INUMTIDS))
+(  162)       LL_THREAD_FIRST=.TRUE.
+(  163)       ISAVE=0
+(  164)       IMAXSTACK=0
+(  165)     ENDIF
+(  166)   ENDIF
+(  167) !JFH------------ End ---------------------------------------------
+(  168) !JFH---Initialisation to monitor heap usage-----------------------
+(  169)   JHEAP=0
+(  170)   CALL GET_ENVIRONMENT_VARIABLE('DR_HOOK_HEAPCHECK',CHEAP)
+(  171)   IF (CHEAP == 'yes' .OR. CHEAP == 'YES' ) JHEAP=1
+(  172)   IF (CHEAP == 'trb' .OR. CHEAP == 'TRB' ) JHEAP=2
+(  173)   IF(IMYTID == 1) THEN
+(  174)     IF(JHEAP>0) THEN
+(  175) !     write(0,*) "HEAPCHECK=",CHEAP,JHEAP
+(  176)       CALL SETHEAPCHECK()
+(  177)     ENDIF
+(  178)   ENDIF
+(  179) !JFH------------ End ---------------------------------------------
+(  180) # 181 "dr_hook_util.F90"
+(  181)  !DrHack initialisation
+(  182)  CALL GET_ENVIRONMENT_VARIABLE('DR_HACK',CLENV)
+(  183)  IF ((CLENV == '1') .and. ( MPL_MYRANK() ==1 )) THEN
+(  184)    LL_DRHACK=.TRUE.  
+(  185)    OPEN (UNIT = NULDRHACK, file = "drhack.txt",position="append",action="write")
+(  186)  ENDIF
+(  187) # 188 "dr_hook_util.F90"
+(  188) ENDIF
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 11
+
+(  189) # 190 "dr_hook_util.F90"
+(  190) !JFH---Code to monitor stack usage by threads---------------------
+(  191) # 192 "dr_hook_util.F90"
+(  192) IF (CSTACK == 'yes' .or. CSTACK == 'YES' ) THEN
+(  193)   IF(IMYTID > 1) THEN
+(  194)     IF(LL_THREAD_FIRST(IMYTID))THEN 
+(  195)       LL_THREAD_FIRST(IMYTID)=.FALSE.
+(  196)       ISAVE(IMYTID)=LOC(LLMPI)
+(  197)     ENDIF
+(  198)     ILOC=LOC(LLMPI)
+(  199)     IF(ISAVE(IMYTID)-ILOC > IMAXSTACK(IMYTID)) THEN
+(  200)       IMAXSTACK(IMYTID)=ISAVE(IMYTID)-ILOC
+(  201)       WRITE(0,'(A,I3,A,I12,2X,A)')"STACKCHECK Max stack usage by thread",imytid," =",IMAXSTACK(IMYTID),CDNAME
+(  202)     ENDIF
+(  203)   ENDIF
+(  204) ENDIF
+(  205) # 206 "dr_hook_util.F90"
+(  206) !JFH------------ End ---------------------------------------------
+(  207) # 208 "dr_hook_util.F90"
+(  208) IF (KCASE == 0) THEN
+(  209)   CALL C_DRHOOK_START(CDNAME, IMYTID, PKEY, CDFILENAME, KSIZEINFO)
+(  210) !JFH---Code to monitor heap usage -------------------------
+(  211)   IF(IMYTID == 1 .AND. MYPROC_STATS == 1 .AND. JHEAP>0) THEN
+(  212)     GETMAXMEM=GETMAXLOC()
+(  213)     IF(GETMAXMEM .GT. MAXMEM) THEN
+(  214)       MAXMEM = GETMAXMEM
+(  215)       WRITE(0,*) "HEAPCHECK Max heap at beg of routine =",MAXMEM," ",CDNAME
+(  216) # 219 "dr_hook_util.F90"
+(  219)     ENDIF
+(  220)   ENDIF
+(  221) !JFH------------ End ---------------------------------------------
+(  222) ELSE IF (KCASE == 1) THEN
+(  223) !JFH---Code to monitor heap usage -------------------------
+(  224)   IF(IMYTID == 1 .AND. MYPROC_STATS == 1 .AND. JHEAP>0) THEN
+(  225)     GETMAXMEM=GETMAXLOC()
+(  226)     IF(GETMAXMEM .GT. MAXMEM) THEN
+(  227)       MAXMEM = GETMAXMEM
+(  228)       WRITE(0,*) "HEAPCHECK Max heap at end of routine =",MAXMEM," ",CDNAME
+(  229) # 232 "dr_hook_util.F90"
+(  232)     ENDIF
+(  233)   ENDIF
+(  234) !JFH------------ End ---------------------------------------------
+(  235)   CALL C_DRHOOK_END  (CDNAME, IMYTID, PKEY, CDFILENAME, KSIZEINFO)
+(  236) ENDIF
+(  237) ! calling the drHackFunction
+(  238) IF (LL_DRHACK) THEN 
+(  239)   CALL DR_HACK(CDNAME,KCASE,NULDRHACK)
+(  240) ENDIF
+(  241) # 244 "dr_hook_util.F90"
+(  244) !GM---Code to find gstats SUMB time-------------------------------
+(  245) IF( LDETAILED_STATS .AND. LLFINDSUMB )THEN
+(  246)   IF( IMYTID==1 .AND. LAST_KNUM>=500 .AND. MYPROC_STATS <= 2 )THEN
+(  247)     IF( LAST_KSWITCH==1 .OR. LAST_KSWITCH==2 )THEN
+(  248)       CALL USER_CLOCK(PELAPSED_TIME=ZCLOCK)
+(  249)       ZDIFF=ZCLOCK-TIME_LAST_CALL
+(  250)       IF( ZDIFF > 0.1_JPRB )THEN
+(  251)         IF( KCASE == 0 )THEN
+(  252)           CLSTR='ENTERED'
+
+
+
+
+
+
+NVFORTRAN (Version    20.11)          12/07/2021  15:28:51      page 12
+
+(  253)         ELSE
+(  254)           CLSTR='EXITED'
+(  255)         ENDIF
+(  256)         IF( NHOOK_MESSAGES < 100000 )THEN
+(  257)           WRITE(0,'("DR_HOOK_UTIL: ",A,2X,A," TIMESUMB=",F10.6)')CDNAME,CLSTR,ZDIFF
+(  258)           NHOOK_MESSAGES=NHOOK_MESSAGES+1
+(  259)         ENDIF
+(  260)       ENDIF
+(  261)     ENDIF
+(  262)   ENDIF
+(  263) ENDIF
+(  264) !GM------------ End ---------------------------------------------
+(  265) # 266 "dr_hook_util.F90"
+(  266) END SUBROUTINE DR_HOOK_UTIL
+(  267) # 268 "dr_hook_util.F90"
+(  268) SUBROUTINE DR_HACK(ROUTINE,START,DRHACKUNIT)
+(  269) ! Different implementation of this have been tested, but this one, even if it is
+(  270) ! not elegant at all, is almost fast.... 
+(  271) # 272 "dr_hook_util.F90"
+(  272) USE PARKIND1  ,ONLY : JPIM
+(  273) IMPLICIT NONE
+(  274) CHARACTER(LEN=*),INTENT(IN) :: ROUTINE
+(  275) INTEGER(KIND=JPIM),INTENT(IN) :: START
+(  276) INTEGER(KIND=JPIM),INTENT(IN) :: DRHACKUNIT
+(  277) INTEGER(KIND=JPIM) :: i
+(  278) CHARACTER(LEN(ROUTINE)) :: ROUTINE_CLEAN
+(  279) # 280 "dr_hook_util.F90"
+(  280) ! replace some special character
+(  281) DO i = 1,LEN(ROUTINE)
+(  282)  SELECT CASE (ROUTINE(i:i))
+(  283)   CASE ("<")
+(  284)    ROUTINE_CLEAN (i:i)="_"
+(  285)   CASE (">")
+(  286)    ROUTINE_CLEAN (i:i)="_"
+(  287)   CASE (":")
+(  288)    ROUTINE_CLEAN (i:i)="_"
+(  289)   CASE (" ")
+(  290)    ROUTINE_CLEAN (i:i)="_"
+(  291)   CASE DEFAULT
+(  292)    ROUTINE_CLEAN (i:i)=ROUTINE(i:i)
+(  293)  END SELECT
+(  294) END DO
+(  295) # 297 "dr_hook_util.F90"
+(  297) IF (START==0) THEN
+(  298)  WRITE(DRHACKUNIT,*) '<',ROUTINE_CLEAN,'>'
+(  299) ELSE
+(  300)  WRITE(DRHACKUNIT,*) '</',ROUTINE_CLEAN,'>'
+(  301)  !CLOSE FILE IF LAST ROUTINE
+(  302)  IF (ROUTINE_CLEAN .eq. 'MODEL_MOD_MODEL_DELETE') THEN
+(  303)    CLOSE (DRHACKUNIT)
+(  304)  ENDIF
+(  305) ENDIF
+(  306) # 307 "dr_hook_util.F90"
+(  307) END SUBROUTINE DR_HACK
